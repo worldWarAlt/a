@@ -1,0 +1,1820 @@
+--[[
+	MorphGui v5
+
+	New in v5 (on top of v4):
+	  * Misc tab: "First Person: Show Body" - in first person you see your whole body and non-head
+	    accessories (capes, backpacks, waist/shoulder items). The head and head accessories stay hidden
+	    so they don't block your view.
+	  * Misc tab: "First Person: Hide Head Accs" - head accessories are always invisible in first person,
+	    even if Show Body is off.
+
+	v4 features: look lock, single instance, reconcile + watchdog, X unloads and restores your outfit.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+
+----------------------------------------------------------------
+-- Single instance: unload the previous copy of this script
+----------------------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if env.MorphGuiUnload then
+	pcall(env.MorphGuiUnload)
+	env.MorphGuiUnload = nil
+end
+
+-- clean up leftovers from older versions of this script
+pcall(function() RunService:UnbindFromRenderStep("MorphGuiStep") end)
+pcall(function() RunService:UnbindFromRenderStep("MorphGuiLook") end)
+pcall(function() RunService:UnbindFromRenderStep("MorphGuiFP") end)
+pcall(function()
+	local oldFolder = workspace:FindFirstChild("MG_Acc")
+	if oldFolder then oldFolder:Destroy() end
+end)
+pcall(function()
+	local oldGui = player:WaitForChild("PlayerGui"):FindFirstChild("MorphGui")
+	if oldGui then oldGui:Destroy() end
+end)
+
+----------------------------------------------------------------
+-- Morph source folder
+----------------------------------------------------------------
+local classModels = ReplicatedStorage:WaitForChild("ClassModels", 15)
+local devFolder = classModels and classModels:WaitForChild("DEV FOLDER", 15)
+local morphFolder = devFolder and devFolder:WaitForChild("DEV MORPH", 15)
+
+if not morphFolder then
+	warn("[MorphGui] Could not find ReplicatedStorage.ClassModels['DEV FOLDER']['DEV MORPH'] - check the names.")
+	if classModels then
+		warn("[MorphGui] ClassModels contains:")
+		for _, c in ipairs(classModels:GetChildren()) do
+			warn("   " .. c.Name .. " (" .. c.ClassName .. ")")
+		end
+	end
+	morphFolder = Instance.new("Folder")
+end
+
+local function findHats(morph)
+	for _, c in ipairs(morph:GetChildren()) do
+		if c.Name:lower():gsub("%s", "") == "hats" then
+			return c
+		end
+	end
+	for _, c in ipairs(morph:GetDescendants()) do
+		if c.Name:lower():gsub("%s", "") == "hats" then
+			return c
+		end
+	end
+	for _, c in ipairs(morph:GetChildren()) do
+		if c:IsA("Accessory") or c:IsA("Shirt") or c:IsA("Pants") then
+			return morph
+		end
+	end
+	return nil
+end
+
+----------------------------------------------------------------
+-- Settings
+----------------------------------------------------------------
+local DEBUG = true            -- prints what the game changed / what got fixed
+local WATCHDOG_INTERVAL = 0.5 -- seconds between safety-net checks
+-- false = the game may make your morph transparent (first-person executions, invisibility, fades).
+-- true  = the look lock also forces Transparency back (this is what blocked your view in v4)
+local LOCK_TRANSPARENCY = false
+
+----------------------------------------------------------------
+-- State
+----------------------------------------------------------------
+local TAG = "MG_Added" -- attribute put on everything this GUI adds to the character
+
+local alive = true
+local conns = {}      -- script-wide connections (disconnected on unload)
+local charConns = {}  -- connections to the current character
+
+local snapshot = nil
+local snapshotBC = nil      -- original BodyColors instance (if any)
+local snapshotColors = nil  -- original per-part colors
+
+local currentMorph = nil
+local currentMorphObj = nil
+local currentHatsOverride = nil
+local plan = {}             -- list of source items that SHOULD be on the character
+local planColors = nil      -- BodyColors the morph wants (or nil)
+
+local hideHead = false
+local autoRefresh = true
+local lockLookOn = true
+local thirdPerson = false
+local origCam = nil
+
+local busy = false          -- lock so full operations never overlap (they can yield)
+local charGen = 0           -- increments every respawn, lets stale tasks bail out
+local ready = true          -- false while a respawn is still loading its outfit
+
+local createdBy = setmetatable({}, { __mode = "k" })  -- [item on character] = source item it was built from
+local released = setmetatable({}, { __mode = "k" })   -- items WE removed on purpose
+local unattached = setmetatable({}, { __mode = "k" }) -- accessories that could not be welded at all
+local knownDesc = setmetatable({}, { __mode = "k" })  -- every descendant that was part of a piece when WE built it
+local dirtyPieces = setmetatable({}, { __mode = "k" })-- pieces whose parts were destroyed / swapped by the game
+local looks = {}                                      -- [piece] = list of { instance, property, expectedValue, rebuildOnly }
+local bodyLook = {}                                   -- list of { bodyPart, property, expectedValue }
+local lookWarned = {}
+local lookFixes = 0
+local curStats = nil
+local lastStats = nil
+
+local statusLabel
+local gui
+
+local function connect(signal, fn)
+	local c = signal:Connect(fn)
+	conns[#conns + 1] = c
+	return c
+end
+
+local function setStatus(text)
+	if statusLabel then
+		statusLabel.Text = text
+	end
+end
+
+-- removes one of OUR pieces on purpose (so nothing tries to "restore" it)
+local function dropPiece(inst)
+	released[inst] = true
+	looks[inst] = nil
+	dirtyPieces[inst] = nil
+	pcall(function() inst:Destroy() end)
+end
+
+----------------------------------------------------------------
+-- Look lock bookkeeping
+----------------------------------------------------------------
+local LOOK_PROPS = {
+	{ "BasePart", { "Color", "Material", "Transparency", "Reflectance" } },
+	{ "MeshPart", { "TextureID", "MeshId" } },
+	{ "SpecialMesh", { "TextureId", "MeshId", "VertexColor" } },
+	{ "Decal", { "Color3", "Transparency", "Texture" } }, -- also covers Texture
+	{ "SurfaceAppearance", { "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "Color" } },
+}
+
+-- game effects that get removed if they appear INSIDE one of our pieces
+local OVERLAY = {
+	Highlight = true, SurfaceAppearance = true, Decal = true, Texture = true,
+	ParticleEmitter = true, Fire = true, Smoke = true, Sparkles = true, Trail = true, Beam = true,
+	PointLight = true, SpotLight = true, SurfaceLight = true, SpecialMesh = true,
+	BillboardGui = true, SurfaceGui = true,
+}
+
+local function warnLook(inst, prop, cur)
+	if not DEBUG then return end
+	local key = inst.Name .. "." .. prop
+	if lookWarned[key] then return end
+	lookWarned[key] = true
+	print("[MorphGui] game changed " .. inst:GetFullName() .. "." .. prop .. " to " .. tostring(cur) .. ", putting it back")
+end
+
+-- records how a freshly built piece looks (called BEFORE it is parented to the character)
+local function recordLook(piece)
+	local rec = {}
+	local function visit(d)
+		knownDesc[d] = true
+		for _, entry in ipairs(LOOK_PROPS) do
+			if d:IsA(entry[1]) then
+				for _, prop in ipairs(entry[2]) do
+					local ok, v = pcall(function() return d[prop] end)
+					if ok then
+						-- MeshPart.MeshId can't be assigned by scripts: if it changes, the piece is rebuilt instead
+						rec[#rec + 1] = { d, prop, v, entry[1] == "MeshPart" and prop == "MeshId" }
+					end
+				end
+			end
+		end
+	end
+	visit(piece)
+	for _, d in ipairs(piece:GetDescendants()) do
+		visit(d)
+	end
+	looks[piece] = rec
+end
+
+local function recordBody(char)
+	table.clear(bodyLook)
+	for _, v in ipairs(char:GetChildren()) do
+		if v:IsA("BasePart") and v.Name ~= "HumanoidRootPart" then
+			bodyLook[#bodyLook + 1] = { v, "Color", v.Color }
+			bodyLook[#bodyLook + 1] = { v, "Material", v.Material }
+		end
+	end
+end
+
+-- body colors take a moment to apply, so record them shortly after any color change
+local bodyPending = false
+local function scheduleRecordBody()
+	if bodyPending then return end
+	bodyPending = true
+	local gen = charGen
+	task.delay(0.4, function()
+		bodyPending = false
+		if not alive or gen ~= charGen or not currentMorphObj then return end
+		local char = player.Character
+		if char then recordBody(char) end
+	end)
+end
+
+----------------------------------------------------------------
+-- Character helpers
+----------------------------------------------------------------
+local function getCharacter()
+	local char = player.Character or player.CharacterAdded:Wait()
+	local hum = char:WaitForChild("Humanoid")
+	return char, hum
+end
+
+local function isOutfitItem(v)
+	return v:IsA("Accoutrement") or v:IsA("Shirt") or v:IsA("Pants") or v:IsA("ShirtGraphic")
+end
+
+local function takeSnapshot(char)
+	local items = {}
+	for _, v in ipairs(char:GetChildren()) do
+		if isOutfitItem(v) and not v:GetAttribute(TAG) then
+			table.insert(items, v:Clone())
+		end
+	end
+	snapshot = items
+
+	local bc = char:FindFirstChildOfClass("BodyColors")
+	snapshotBC = (bc and not bc:GetAttribute(TAG)) and bc:Clone() or nil
+
+	snapshotColors = {}
+	for _, v in ipairs(char:GetChildren()) do
+		if v:IsA("BasePart") then
+			snapshotColors[v.Name] = v.Color
+		end
+	end
+end
+
+local function setBodyColors(char, bc)
+	table.clear(bodyLook) -- old expectations would fight the new colors
+	local old = char:FindFirstChildOfClass("BodyColors")
+	if old then old:Destroy() end
+	if bc then
+		local c = bc:Clone()
+		c:SetAttribute(TAG, true)
+		c.Parent = char
+	end
+	scheduleRecordBody()
+end
+
+local function restoreOriginalColors(char)
+	table.clear(bodyLook)
+	setBodyColors(char, snapshotBC)
+	if snapshotColors then
+		for name, color in pairs(snapshotColors) do
+			local part = char:FindFirstChild(name)
+			if part and part:IsA("BasePart") then
+				part.Color = color
+			end
+		end
+	end
+	scheduleRecordBody()
+end
+
+local function sameColors(a, b)
+	return a.HeadColor3 == b.HeadColor3 and a.TorsoColor3 == b.TorsoColor3
+		and a.LeftArmColor3 == b.LeftArmColor3 and a.RightArmColor3 == b.RightArmColor3
+		and a.LeftLegColor3 == b.LeftLegColor3 and a.RightLegColor3 == b.RightLegColor3
+end
+
+-- is this instance part of something this GUI added (walks up to the character's direct child)
+local function isOurs(d, char)
+	local top = d
+	while top.Parent and top.Parent ~= char do
+		top = top.Parent
+	end
+	return top:GetAttribute(TAG) == true
+end
+
+----------------------------------------------------------------
+-- Hide face / head
+----------------------------------------------------------------
+local function setHidden(obj, hide)
+	if hide then
+		if obj:GetAttribute("MG_T") == nil then
+			obj:SetAttribute("MG_T", obj.Transparency)
+		end
+		obj.Transparency = 1
+	else
+		local orig = obj:GetAttribute("MG_T")
+		if orig ~= nil then
+			obj.Transparency = orig
+			obj:SetAttribute("MG_T", nil)
+		end
+	end
+end
+
+local function hideVisuals(root, hide)
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture") then
+			setHidden(d, hide)
+		end
+	end
+	if root:IsA("BasePart") then
+		setHidden(root, hide)
+	end
+end
+
+local function isFaceItem(item)
+	if item:IsA("Accessory") then
+		if item.AccessoryType == Enum.AccessoryType.Face then
+			return true
+		end
+		local handle = item:FindFirstChild("Handle")
+		if handle then
+			for _, a in ipairs(handle:GetChildren()) do
+				if a:IsA("Attachment") and a.Name:find("^Face") then
+					return true
+				end
+			end
+		end
+	end
+	return item.Name:lower():find("face") ~= nil
+end
+
+local function applyHeadState()
+	local char = player.Character
+	if not char then return end
+
+	local hide = hideHead and currentMorph ~= nil
+
+	local head = char:FindFirstChild("Head")
+	if head and head:IsA("BasePart") then
+		-- the head part itself + every decal/texture (the face) on it
+		setHidden(head, hide)
+		for _, d in ipairs(head:GetDescendants()) do
+			if d:IsA("Decal") or d:IsA("Texture") or d:IsA("BasePart") then
+				setHidden(d, hide)
+			end
+		end
+	end
+
+	-- face accessories / face models, including any decals inside them
+	for _, item in ipairs(char:GetChildren()) do
+		if (item:IsA("Accessory") or item:IsA("Model")) and isFaceItem(item) then
+			hideVisuals(item, hide)
+		end
+	end
+end
+
+local headPending = false
+local function scheduleHeadState()
+	if headPending then return end
+	headPending = true
+	task.delay(0.1, function()
+		headPending = false
+		if alive and hideHead and currentMorph then
+			applyHeadState()
+		end
+	end)
+end
+
+----------------------------------------------------------------
+-- Building ONE piece (every piece we add is tagged and registered in createdBy)
+----------------------------------------------------------------
+local function prepParts(root)
+	for _, p in ipairs(root:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.Anchored = false
+			p.CanCollide = false
+			p.Massless = true
+		end
+	end
+end
+
+-- welds the accessory to the matching attachment on the character (the method that worked in the old version)
+local function attachAccessory(acc, char)
+	local handle = acc:FindFirstChild("Handle")
+	if not handle or not handle:IsA("BasePart") then
+		unattached[acc] = true
+		if curStats then curStats.failed += 1 end
+		warn("[MorphGui] accessory '" .. acc.Name .. "' has no Handle part, can't attach it")
+		return false
+	end
+
+	-- drop stale welds copied along with the item
+	for _, d in ipairs(handle:GetChildren()) do
+		if d:IsA("Weld") or d:IsA("WeldConstraint") or d:IsA("Motor6D") or d:IsA("ManualWeld") then
+			if not (d.Part1 and d.Part1:IsDescendantOf(acc)) then
+				d:Destroy()
+			end
+		end
+	end
+
+	local weld = Instance.new("Weld")
+	weld.Name = "AccessoryWeld"
+	weld.Part0 = handle
+
+	local function finish(part1)
+		weld.Part1 = part1
+		handle.CFrame = part1.CFrame * weld.C1 * weld.C0:Inverse()
+		weld.Parent = handle
+	end
+
+	for _, att in ipairs(handle:GetChildren()) do
+		if att:IsA("Attachment") then
+			for _, bodyPart in ipairs(char:GetChildren()) do
+				if bodyPart:IsA("BasePart") then
+					local target = bodyPart:FindFirstChild(att.Name)
+					if target and target:IsA("Attachment") then
+						weld.C0 = att.CFrame
+						weld.C1 = target.CFrame
+						finish(bodyPart)
+						return true
+					end
+				end
+			end
+		end
+	end
+
+	local head = char:FindFirstChild("Head")
+	if head then
+		weld.C0 = acc.AttachmentPoint
+		weld.C1 = CFrame.new(0, head.Size.Y / 2, 0)
+		finish(head)
+		warn("[MorphGui] '" .. acc.Name .. "' has no matching attachment on your character, placed on head")
+		return true
+	end
+
+	unattached[acc] = true
+	if curStats then curStats.failed += 1 end
+	return false
+end
+
+local function buildAccessory(template, src, char)
+	local acc = template:Clone()
+	acc:SetAttribute(TAG, true)
+	createdBy[acc] = src
+	prepParts(acc)
+
+	if not acc:FindFirstChild("Handle") then
+		-- main part isn't called "Handle": use the first part inside the accessory
+		local part = acc:FindFirstChildWhichIsA("BasePart")
+		if part then
+			part.Name = "Handle"
+		end
+	end
+
+	attachAccessory(acc, char)
+	recordLook(acc) -- remember the pristine look BEFORE the game can touch it
+	acc.Parent = char
+	return acc
+end
+
+local function attachModel(model, char)
+	local clone = model:Clone()
+	local root = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart", true)
+	local head = char:FindFirstChild("Head")
+	if not root or not head then
+		clone:Destroy()
+		return nil
+	end
+	for _, p in ipairs(clone:GetDescendants()) do
+		if p:IsA("BasePart") then
+			p.Anchored = false
+			p.CanCollide = false
+			p.Massless = true
+			if p ~= root then
+				local wc = Instance.new("WeldConstraint")
+				wc.Part0 = root
+				wc.Part1 = p
+				wc.Parent = p
+			end
+		end
+	end
+	clone:SetAttribute(TAG, true)
+	createdBy[clone] = model
+	recordLook(clone)
+	clone.Parent = char
+	local w = Instance.new("Weld")
+	w.Part0 = head
+	w.Part1 = root
+	w.C0 = CFrame.new(0, head.Size.Y / 2 + root.Size.Y / 2, 0)
+	w.Parent = root
+	return clone
+end
+
+-- builds exactly one instance on the character for one source item; returns it (or nil)
+local function buildLeaf(src, char)
+	if src:IsA("Accoutrement") then
+		return buildAccessory(src, src, char)
+	elseif src:IsA("BasePart") then
+		local tmpl = Instance.new("Accessory")
+		tmpl.Name = src.Name
+		local h = src:Clone()
+		h.Name = "Handle"
+		h.Parent = tmpl
+		local made = buildAccessory(tmpl, src, char)
+		tmpl:Destroy()
+		return made
+	elseif src:IsA("Shirt") or src:IsA("Pants") or src:IsA("ShirtGraphic") then
+		local c = src:Clone()
+		c:SetAttribute(TAG, true)
+		createdBy[c] = src
+		c.Parent = char
+		return c
+	elseif src:IsA("Model") then
+		return attachModel(src, char)
+	end
+	return nil
+end
+
+-- flattens a morph's "hats" container into a list of leaf items
+local function collectLeaves(item, out)
+	if item:IsA("Accoutrement") or item:IsA("BasePart")
+		or item:IsA("Shirt") or item:IsA("Pants") or item:IsA("ShirtGraphic") then
+		out[#out + 1] = item
+	elseif item:IsA("Folder") or item:IsA("Model") then
+		local hasNested = item:IsA("Folder")
+		if not hasNested then
+			for _, d in ipairs(item:GetDescendants()) do
+				if d:IsA("Accoutrement") or d:IsA("Shirt") or d:IsA("Pants") then
+					hasNested = true
+					break
+				end
+			end
+		end
+		if hasNested then
+			for _, child in ipairs(item:GetChildren()) do
+				collectLeaves(child, out)
+			end
+		else
+			out[#out + 1] = item
+		end
+	elseif item:IsA("BodyColors") or item:IsA("Humanoid") or item:IsA("ValueBase") then
+		-- handled separately / ignored
+	else
+		warn("[MorphGui] unsupported item type: " .. item:GetFullName() .. " (" .. item.ClassName .. ")")
+	end
+end
+
+----------------------------------------------------------------
+-- RECONCILE: make the character match the plan. Safe to run any number of times.
+--   keeps healthy pieces, re-adds missing ones, rebuilds damaged ones, removes duplicates,
+--   leftovers from other morphs and the game's own outfit pieces.
+-- It never yields, so it can't overlap itself.
+----------------------------------------------------------------
+local function isHealthy(inst, char)
+	if inst.Parent ~= char then return false end
+	if inst:IsA("Accoutrement") then
+		if unattached[inst] then return true end -- can't be fixed by rebuilding anyway
+		local h = inst:FindFirstChild("Handle")
+		if not (h and h:IsA("BasePart")) then return false end
+		for _, d in ipairs(h:GetChildren()) do
+			if d:IsA("JointInstance") or d:IsA("WeldConstraint") then
+				local other = (d.Part0 == h) and d.Part1 or d.Part0
+				if other and other ~= h and other:IsDescendantOf(char) then
+					return true
+				end
+			end
+		end
+		return false
+	end
+	return true
+end
+
+local function ensureColors(char, stats)
+	if not planColors then return end
+	local cur = char:FindFirstChildOfClass("BodyColors")
+	if cur and sameColors(cur, planColors) then return end
+	setBodyColors(char, planColors)
+	if stats then stats.colors = true end
+end
+
+local function reconcile(char, hum, force)
+	local stats = { added = 0, removed = 0, deduped = 0, foreign = 0, failed = 0, colors = false }
+	curStats = stats
+
+	local want = {}
+	for _, s in ipairs(plan) do want[s] = true end
+
+	-- 1) look at everything on the character
+	local have = {} -- [source] = { our instances built from it }
+	for _, v in ipairs(char:GetChildren()) do
+		if v:IsA("BodyColors") then
+			-- colors are handled by ensureColors
+		elseif v:GetAttribute(TAG) then
+			local src = createdBy[v]
+			if force or not (src and want[src]) then
+				-- leftover from another morph / another copy of the script / forced rebuild
+				dropPiece(v)
+				stats.removed += 1
+			elseif dirtyPieces[v] then
+				-- the game destroyed / swapped a part of it: rebuild it from the source below
+				dropPiece(v)
+			else
+				local l = have[src]
+				if not l then
+					l = {}
+					have[src] = l
+				end
+				l[#l + 1] = v
+			end
+		elseif currentMorphObj and isOutfitItem(v) then
+			-- the game's own outfit piece, the morph replaces it
+			pcall(function() v:Destroy() end)
+			stats.foreign += 1
+		end
+	end
+
+	-- 2) every planned piece must exist exactly once and be healthy
+	for _, src in ipairs(plan) do
+		local keep = nil
+		local l = have[src]
+		if l then
+			for _, inst in ipairs(l) do
+				if not keep and isHealthy(inst, char) then
+					keep = inst
+				else
+					dropPiece(inst)
+					stats.deduped += 1
+				end
+			end
+		end
+		if not keep then
+			local ok, res = pcall(buildLeaf, src, char)
+			if ok and res then
+				stats.added += 1
+			else
+				stats.failed += 1
+				warn("[MorphGui] couldn't add '" .. src.Name .. "' (" .. src.ClassName .. ")"
+					.. (ok and "" or (": " .. tostring(res))))
+			end
+		end
+	end
+
+	-- 3) colors
+	ensureColors(char, stats)
+
+	curStats = nil
+	return stats
+end
+
+local function changedCount(s)
+	return s.added + s.removed + s.deduped + s.foreign + (s.colors and 1 or 0)
+end
+
+local function describe(s)
+	local parts = {}
+	if s.added > 0 then parts[#parts + 1] = "re-added " .. s.added end
+	local extra = s.removed + s.deduped + s.foreign
+	if extra > 0 then parts[#parts + 1] = "removed " .. extra .. " extra" end
+	if s.colors then parts[#parts + 1] = "fixed colors" end
+	if s.failed > 0 then parts[#parts + 1] = s.failed .. " FAILED (see Output)" end
+	if #parts == 0 then
+		return "all " .. #plan .. " pieces OK"
+	end
+	return table.concat(parts, ", ")
+end
+
+----------------------------------------------------------------
+-- Auto refresh (debounced events + a cheap watchdog; all of it funnels into the same reconcile)
+----------------------------------------------------------------
+local fight = { n = 0, t = 0, block = 0 }
+local function noteFix()
+	local now = os.clock()
+	if now - fight.t > 3 then
+		fight.n = 0
+		fight.t = now
+	end
+	fight.n += 1
+	if fight.n > 8 then
+		fight.n = 0
+		fight.block = now + 4
+		warn("[MorphGui] something keeps changing your outfit (8 fixes in 3s) - pausing auto refresh for 4s. "
+			.. "If this keeps happening, an older copy of a morph script is still running: rejoin and run only this version.")
+	end
+end
+
+local function runReconcile(reason)
+	if not alive or not currentMorphObj or not ready or busy or not autoRefresh then return end
+	if os.clock() < fight.block then return end
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not char or not hum or hum.Health <= 0 or not char:IsDescendantOf(workspace) then return end
+
+	local ok, stats = pcall(reconcile, char, hum)
+	curStats = nil
+	if not ok then
+		warn("[MorphGui] auto refresh failed: " .. tostring(stats))
+		return
+	end
+	if changedCount(stats) > 0 then
+		noteFix()
+		if DEBUG then
+			print("[MorphGui] auto refresh (" .. reason .. "): " .. describe(stats))
+		end
+		if hideHead then applyHeadState() end
+		setStatus("Auto refresh: " .. describe(stats))
+	end
+end
+
+local pending = false
+local function scheduleReconcile(reason)
+	if pending or not alive or not currentMorphObj or not autoRefresh then return end
+	pending = true
+	task.delay(0.05, function()
+		pending = false
+		runReconcile(reason)
+	end)
+end
+
+----------------------------------------------------------------
+-- LOOK LOCK: runs every frame right before rendering (after the game's own render-step code),
+-- so whatever the game set this frame is replaced by the morph's real look before you see it.
+----------------------------------------------------------------
+local function enforceLooks()
+	if not alive or not currentMorphObj or not lockLookOn then return end
+	local fixed = 0
+	local dirty = false
+
+	for piece, rec in pairs(looks) do
+		if piece.Parent then
+			for i = 1, #rec do
+				local r = rec[i]
+				local inst, prop = r[1], r[2]
+				if inst.Parent == nil then
+					-- a part of this piece was destroyed by the game
+					if not dirtyPieces[piece] then
+						dirtyPieces[piece] = true
+						dirty = true
+					end
+					break
+				end
+				local expected = r[3]
+				if prop == "Transparency" and inst:GetAttribute("MG_T") ~= nil then
+					expected = 1 -- hidden on purpose by the "Hide Face & Head" toggle
+				end
+				local cur = inst[prop]
+				if cur ~= expected then
+					if r[4] then
+						-- can't be assigned (mesh swapped): rebuild the piece instead
+						warnLook(inst, prop, cur)
+						if not dirtyPieces[piece] then
+							dirtyPieces[piece] = true
+							dirty = true
+						end
+						break
+					end
+					warnLook(inst, prop, cur)
+					if pcall(function() inst[prop] = expected end) then
+						fixed += 1
+					end
+				end
+			end
+		end
+	end
+
+	for i = 1, #bodyLook do
+		local r = bodyLook[i]
+		local inst, prop = r[1], r[2]
+		if inst.Parent then
+			local cur = inst[prop]
+			if cur ~= r[3] then
+				warnLook(inst, prop, cur)
+				if pcall(function() inst[prop] = r[3] end) then
+					fixed += 1
+				end
+			end
+		end
+	end
+
+	if fixed > 0 then
+		lookFixes += fixed
+	end
+	if dirty then
+		scheduleReconcile("a part of a morph piece changed")
+	end
+end
+
+pcall(function() RunService:UnbindFromRenderStep("MorphGuiLook") end)
+RunService:BindToRenderStep("MorphGuiLook", Enum.RenderPriority.Last.Value + 1, function()
+	local ok, err = pcall(enforceLooks)
+	if not ok and not lookWarned["_err"] then
+		lookWarned["_err"] = true
+		warn("[MorphGui] look lock error: " .. tostring(err))
+	end
+end)
+
+----------------------------------------------------------------
+-- Morph / reset / refresh
+----------------------------------------------------------------
+local function doMorph(morph, hatsOverride)
+	local char, hum = getCharacter()
+	if not snapshot then
+		takeSnapshot(char)
+	end
+
+	local hats = hatsOverride or findHats(morph)
+	if not hats then
+		warn("Morph '" .. morph.Name .. "' has no hats folder")
+		return false
+	end
+
+	local leaves = {}
+	for _, item in ipairs(hats:GetChildren()) do
+		collectLeaves(item, leaves)
+	end
+	local bc = morph:FindFirstChildOfClass("BodyColors") or hats:FindFirstChildOfClass("BodyColors")
+
+	plan = leaves
+	planColors = bc
+	currentMorph = morph.Name
+	currentMorphObj = morph
+	currentHatsOverride = hatsOverride
+	table.clear(lookWarned)
+	table.clear(bodyLook)
+
+	lastStats = reconcile(char, hum)
+	if not bc then
+		-- no colors in the morph: go back to the original ones (stops the previous morph's colors sticking)
+		restoreOriginalColors(char)
+	end
+
+	applyHeadState()
+	scheduleRecordBody()
+	return true
+end
+
+local function morphMessage(name)
+	local msg = "Morphed into: " .. name .. " (" .. #plan .. " pieces"
+	if lastStats and lastStats.failed > 0 then
+		msg = msg .. ", " .. lastStats.failed .. " FAILED - see Output"
+	end
+	return msg .. ")"
+end
+
+-- synchronous reset (no yielding), also used by unload
+local function resetNow()
+	if not snapshot then return false end
+	local char = player.Character
+	if not char then return false end
+
+	plan = {}
+	planColors = nil
+	currentMorph = nil
+	currentMorphObj = nil
+	currentHatsOverride = nil
+	table.clear(bodyLook)
+
+	for _, v in ipairs(char:GetChildren()) do
+		if not v:IsA("BodyColors") and (v:GetAttribute(TAG) or isOutfitItem(v)) then
+			dropPiece(v)
+		end
+	end
+	for _, item in ipairs(snapshot) do
+		local ok, err = pcall(buildLeaf, item, char)
+		if not ok then
+			warn("[MorphGui] couldn't restore '" .. item.Name .. "': " .. tostring(err))
+		end
+	end
+	table.clear(looks) -- no morph active: nothing to lock
+	curStats = nil
+	restoreOriginalColors(char)
+	applyHeadState() -- brings face/head back
+	return true
+end
+
+local function locked(fn, ...)
+	while busy do task.wait() end
+	busy = true
+	local ok, res = pcall(fn, ...)
+	busy = false
+	if not ok then
+		warn("[MorphGui] " .. tostring(res))
+		return false
+	end
+	return res
+end
+
+local function morphInto(morph, hatsOverride)
+	return locked(doMorph, morph, hatsOverride)
+end
+
+local function resetMorph()
+	return locked(resetNow)
+end
+
+-- Refresh button: reconcile (keeps what's fine, fixes what's not). force = rebuild everything.
+local function refreshNow(force)
+	if not currentMorphObj then return false end
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not (char and hum) then return false end
+	local stats = reconcile(char, hum, force)
+	applyHeadState()
+	return stats
+end
+
+----------------------------------------------------------------
+-- First person body / head accessory control
+----------------------------------------------------------------
+local fpBody = false         -- show whole body + accessories in first person
+local fpHideHeadAcc = false  -- head accessories always invisible in first person
+local fpTouched = setmetatable({}, { __mode = "k" }) -- parts we forced via LocalTransparencyModifier
+local fpPieceCache = setmetatable({}, { __mode = "k" })
+
+pcall(function() RunService:UnbindFromRenderStep("MorphGuiFP") end)
+
+-- true if this accessory/model is welded to the head (hats, hair, face items)
+local function isHeadPiece(piece, head)
+	local cached = fpPieceCache[piece]
+	if cached ~= nil then return cached end
+	local foundJoint = false
+	for _, d in ipairs(piece:GetDescendants()) do
+		if d:IsA("JointInstance") or d:IsA("WeldConstraint") then
+			local p0, p1 = d.Part0, d.Part1
+			if p0 == head or p1 == head then
+				fpPieceCache[piece] = true
+				return true
+			end
+			if p0 and p1 and not (p0:IsDescendantOf(piece) and p1:IsDescendantOf(piece)) then
+				foundJoint = true -- welded to something outside the piece, and it isn't the head
+			end
+		end
+	end
+	if foundJoint then fpPieceCache[piece] = false end
+	return false
+end
+
+local function setPieceFP(piece, mod)
+	for _, d in ipairs(piece:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.LocalTransparencyModifier = mod
+			fpTouched[d] = true
+		end
+	end
+	if piece:IsA("BasePart") then
+		piece.LocalTransparencyModifier = mod
+		fpTouched[piece] = true
+	end
+end
+
+local function fpStep()
+	if not alive then return end
+	local char = player.Character
+	local cam = workspace.CurrentCamera
+	local head = char and char:FindFirstChild("Head")
+	if not (head and cam) then return end
+
+	local inFP = (cam.CFrame.Position - head.Position).Magnitude < 1.5
+		or player.CameraMode == Enum.CameraMode.LockFirstPerson
+
+	if not (inFP and (fpBody or fpHideHeadAcc)) then
+		-- leaving first person (or toggles off): give control back
+		for part in pairs(fpTouched) do
+			if part.Parent then part.LocalTransparencyModifier = 0 end
+			fpTouched[part] = nil
+		end
+		return
+	end
+
+	for _, v in ipairs(char:GetChildren()) do
+		if v.Name ~= "HumanoidRootPart" then
+			if v:IsA("Accoutrement") or v:IsA("Model") then
+				if isHeadPiece(v, head) then
+					setPieceFP(v, 1) -- head accessories: always invisible in first person
+				elseif fpBody then
+					setPieceFP(v, 0)
+				end
+			elseif v:IsA("BasePart") and fpBody then
+				setPieceFP(v, v == head and 1 or 0)
+			end
+		end
+	end
+end
+
+RunService:BindToRenderStep("MorphGuiFP", Enum.RenderPriority.Last.Value + 2, function()
+	pcall(fpStep)
+end)
+
+----------------------------------------------------------------
+-- Third person (first person stays available by scrolling in)
+----------------------------------------------------------------
+local TP_DISTANCE = 12
+local zoomBusy = false
+
+local function fixCamera()
+	local cam = workspace.CurrentCamera
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if cam and hum then
+		cam.CameraType = Enum.CameraType.Custom
+		cam.CameraSubject = hum
+	end
+end
+
+-- keeps the game from locking you back into first person, but doesn't lock you out of it
+local function enforceThirdPerson()
+	if not alive or not thirdPerson or zoomBusy then return end
+	if player.CameraMode ~= Enum.CameraMode.Classic then
+		player.CameraMode = Enum.CameraMode.Classic
+	end
+	if player.CameraMinZoomDistance > 0.5 then
+		player.CameraMinZoomDistance = 0.5
+	end
+	if player.CameraMaxZoomDistance < 20 then
+		player.CameraMaxZoomDistance = 128
+	end
+end
+
+-- pushes the camera out to a third person distance once, then frees the zoom range again
+local function pushOut()
+	if not thirdPerson then return end
+	zoomBusy = true
+	player.CameraMode = Enum.CameraMode.Classic
+	player.CameraMaxZoomDistance = math.max(TP_DISTANCE, player.CameraMinZoomDistance)
+	player.CameraMinZoomDistance = TP_DISTANCE
+	player.CameraMaxZoomDistance = TP_DISTANCE
+	fixCamera()
+	task.wait(0.35)
+	player.CameraMinZoomDistance = 0.5
+	player.CameraMaxZoomDistance = 128
+	zoomBusy = false
+	enforceThirdPerson()
+end
+
+local function setThirdPerson(on)
+	if on == thirdPerson then return end
+	if on then
+		origCam = {
+			mode = player.CameraMode,
+			min = player.CameraMinZoomDistance,
+			max = player.CameraMaxZoomDistance,
+		}
+		thirdPerson = true
+		task.spawn(pushOut)
+	else
+		thirdPerson = false
+		zoomBusy = false
+		if origCam then
+			player.CameraMaxZoomDistance = origCam.max
+			player.CameraMinZoomDistance = origCam.min
+			player.CameraMode = origCam.mode
+		end
+	end
+end
+
+connect(player:GetPropertyChangedSignal("CameraMode"), enforceThirdPerson)
+connect(player:GetPropertyChangedSignal("CameraMinZoomDistance"), enforceThirdPerson)
+connect(player:GetPropertyChangedSignal("CameraMaxZoomDistance"), enforceThirdPerson)
+
+----------------------------------------------------------------
+-- Character hooks + respawn
+----------------------------------------------------------------
+local function disconnectChar()
+	for _, c in ipairs(charConns) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(charConns)
+end
+
+local function hookCharacter(char)
+	disconnectChar()
+	local function add(c) charConns[#charConns + 1] = c end
+
+	-- something took one of OUR pieces off the character
+	add(char.ChildRemoved:Connect(function(child)
+		if not alive or not currentMorphObj then return end
+		if child:GetAttribute(TAG) and not released[child] and not child:IsA("BodyColors") then
+			if child.Parent ~= nil then
+				-- it was moved somewhere else (not destroyed): drop that stray copy, reconcile re-adds a clean one
+				dropPiece(child)
+			end
+			scheduleReconcile("a morph piece was removed")
+		end
+	end))
+
+	-- something was added that isn't ours (game outfit / colors), or a stray copy of ours
+	add(char.ChildAdded:Connect(function(child)
+		if not alive or not currentMorphObj then return end
+		if child:GetAttribute(TAG) then
+			if not createdBy[child] and not child:IsA("BodyColors") then
+				scheduleReconcile("stray copy")
+			end
+		elseif isOutfitItem(child) or child:IsA("BodyColors") then
+			scheduleReconcile("the game added " .. child.Name)
+		end
+	end))
+
+	add(char.DescendantAdded:Connect(function(d)
+		if not alive then return end
+		if hideHead and currentMorph and not isOurs(d, char) then
+			scheduleHeadState()
+		end
+		if not currentMorphObj then return end
+
+		-- the game put a visual effect INSIDE one of our pieces (highlight, extra texture, particles...): remove it
+		if lockLookOn and OVERLAY[d.ClassName] and not knownDesc[d] and isOurs(d, char) then
+			if DEBUG then
+				print("[MorphGui] removed a game effect (" .. d.ClassName .. " '" .. d.Name .. "') from a morph piece")
+			end
+			pcall(function() d:Destroy() end)
+		elseif DEBUG and (d:IsA("Highlight") or d:IsA("ForceField")) and not isOurs(d, char) then
+			local key = "fx" .. d.ClassName
+			if not lookWarned[key] then
+				lookWarned[key] = true
+				print("[MorphGui] the game added a " .. d.ClassName .. " to your character (" .. d:GetFullName() .. ")")
+			end
+		end
+	end))
+end
+
+-- HasAppearanceLoaded is already true when a respawned character is added, so wait for
+-- CharacterAppearanceLoaded (with a minimum wait and a timeout as a safety net)
+local function waitForAppearance(timeout)
+	local done = false
+	local c = player.CharacterAppearanceLoaded:Connect(function() done = true end)
+	local t = os.clock()
+	while alive and not done and os.clock() - t < timeout do
+		if player:HasAppearanceLoaded() and os.clock() - t >= 1.5 then
+			break
+		end
+		task.wait(0.1)
+	end
+	c:Disconnect()
+end
+
+connect(player.CharacterAdded, function(char)
+	charGen += 1
+	local myGen = charGen
+	snapshot = nil
+	snapshotBC = nil
+	snapshotColors = nil
+	ready = false
+	table.clear(looks)
+	table.clear(bodyLook)
+	table.clear(fpTouched)
+	hookCharacter(char)
+
+	task.spawn(function()
+		local hum = char:WaitForChild("Humanoid", 10)
+		if not hum then
+			if charGen == myGen then ready = true end
+			return
+		end
+
+		waitForAppearance(8)
+		task.wait(0.5)
+		if not alive or charGen ~= myGen or player.Character ~= char then return end
+
+		-- remember the game's outfit for "Reset", then put the morph back on
+		takeSnapshot(char)
+		if currentMorphObj then
+			local stats = locked(function()
+				local s = reconcile(char, hum)
+				applyHeadState()
+				return s
+			end)
+			if stats then
+				setStatus("Morph re-applied: " .. tostring(currentMorph))
+			end
+			scheduleRecordBody()
+		end
+
+		if charGen ~= myGen then return end
+		ready = true
+
+		if thirdPerson then
+			pushOut()
+		end
+	end)
+end)
+
+if player.Character then
+	local okHook, errHook = pcall(hookCharacter, player.Character)
+	if not okHook then
+		warn("[MorphGui] hookCharacter failed: " .. tostring(errHook))
+	end
+end
+
+-- watchdog: catches whatever the events miss (broken welds, new game outfit pieces, moved pieces)
+-- and reports how many game changes the look lock has undone
+task.spawn(function()
+	while alive do
+		task.wait(WATCHDOG_INTERVAL)
+		if not alive then break end
+		runReconcile("watchdog")
+		if lookFixes > 0 then
+			setStatus("Look lock: undid " .. (lookFixes > 99 and "99+" or tostring(lookFixes)) .. " game changes")
+			lookFixes = 0
+		end
+	end
+end)
+
+----------------------------------------------------------------
+-- GUI
+----------------------------------------------------------------
+gui = Instance.new("ScreenGui")
+gui.Name = "MorphGui"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(300, 420)
+main.Position = UDim2.new(0.5, -150, 0.5, -210)
+main.BackgroundColor3 = Color3.fromRGB(24, 24, 32)
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 12)
+
+local stroke = Instance.new("UIStroke", main)
+stroke.Color = Color3.fromRGB(120, 90, 255)
+stroke.Thickness = 1.5
+
+local title = Instance.new("Frame")
+title.Name = "TitleBar"
+title.Size = UDim2.new(1, 0, 0, 42)
+title.BackgroundColor3 = Color3.fromRGB(36, 34, 52)
+title.BorderSizePixel = 0
+title.Parent = main
+
+local grad = Instance.new("UIGradient", title)
+grad.Color = ColorSequence.new(Color3.fromRGB(120, 90, 255), Color3.fromRGB(60, 160, 255))
+grad.Rotation = 0
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.BackgroundTransparency = 1
+titleLabel.Size = UDim2.new(1, -90, 1, 0)
+titleLabel.Position = UDim2.fromOffset(14, 0)
+titleLabel.Text = "Morph Selector"
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 17
+titleLabel.TextColor3 = Color3.new(1, 1, 1)
+titleLabel.Parent = title
+
+local function makeTitleButton(text, xOffset)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(26, 26)
+	b.Position = UDim2.new(1, xOffset, 0.5, -13)
+	b.BackgroundColor3 = Color3.fromRGB(20, 20, 28)
+	b.BackgroundTransparency = 0.35
+	b.Text = text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 16
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.AutoButtonColor = true
+	b.Parent = title
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+	return b
+end
+
+local closeBtn = makeTitleButton("X", -36)
+local minBtn = makeTitleButton("-", -68)
+
+local search = Instance.new("TextBox")
+search.Size = UDim2.new(1, -24, 0, 30)
+search.Position = UDim2.fromOffset(12, 84)
+search.BackgroundColor3 = Color3.fromRGB(36, 36, 48)
+search.PlaceholderText = "Search morphs..."
+search.PlaceholderColor3 = Color3.fromRGB(140, 140, 160)
+search.Text = ""
+search.ClearTextOnFocus = false
+search.Font = Enum.Font.Gotham
+search.TextSize = 14
+search.TextColor3 = Color3.new(1, 1, 1)
+search.Parent = main
+Instance.new("UICorner", search).CornerRadius = UDim.new(0, 8)
+
+local function makeList(name)
+	local l = Instance.new("ScrollingFrame")
+	l.Name = name
+	l.Size = UDim2.new(1, -24, 1, -208)
+	l.Position = UDim2.fromOffset(12, 122)
+	l.BackgroundTransparency = 1
+	l.BorderSizePixel = 0
+	l.ScrollBarThickness = 4
+	l.ScrollBarImageColor3 = Color3.fromRGB(120, 90, 255)
+	l.CanvasSize = UDim2.new()
+	l.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	l.Visible = false
+	l.Parent = main
+
+	local lay = Instance.new("UIListLayout", l)
+	lay.Padding = UDim.new(0, 6)
+	lay.SortOrder = Enum.SortOrder.Name
+	return l
+end
+
+local list = makeList("MorphList")
+local customList = makeList("CustomList")
+local miscList = makeList("MiscList")
+
+local tabBar = Instance.new("Frame")
+tabBar.Name = "TabBar"
+tabBar.Size = UDim2.new(1, -24, 0, 28)
+tabBar.Position = UDim2.fromOffset(12, 50)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = main
+
+local function makeTab(text, index)
+	local t = Instance.new("TextButton")
+	t.Size = UDim2.new(1 / 3, -4, 1, 0)
+	t.Position = UDim2.new((index - 1) / 3, (index - 1) * 2, 0, 0)
+	t.BackgroundColor3 = Color3.fromRGB(40, 40, 56)
+	t.Text = text
+	t.Font = Enum.Font.GothamBold
+	t.TextSize = 13
+	t.TextColor3 = Color3.new(1, 1, 1)
+	t.AutoButtonColor = false
+	t.Parent = tabBar
+	Instance.new("UICorner", t).CornerRadius = UDim.new(0, 8)
+	return t
+end
+
+local morphsTab = makeTab("Morphs", 1)
+local customTab = makeTab("Custom", 2)
+local miscTab = makeTab("Misc", 3)
+
+local status = Instance.new("TextLabel")
+status.BackgroundTransparency = 1
+status.Size = UDim2.new(1, -24, 0, 18)
+status.Position = UDim2.new(0, 12, 1, -76)
+status.Text = "Pick a morph"
+status.Font = Enum.Font.Gotham
+status.TextSize = 13
+status.TextColor3 = Color3.fromRGB(170, 170, 190)
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextTruncate = Enum.TextTruncate.AtEnd
+status.Parent = main
+statusLabel = status
+
+local resetBtn = Instance.new("TextButton")
+resetBtn.Size = UDim2.new(1, -24, 0, 34)
+resetBtn.Position = UDim2.new(0, 12, 1, -46)
+resetBtn.BackgroundColor3 = Color3.fromRGB(200, 70, 90)
+resetBtn.Text = "Reset to my outfit"
+resetBtn.Font = Enum.Font.GothamBold
+resetBtn.TextSize = 14
+resetBtn.TextColor3 = Color3.new(1, 1, 1)
+resetBtn.Parent = main
+Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 8)
+
+----------------------------------------------------------------
+-- Morph / custom buttons
+----------------------------------------------------------------
+local buttons = {}
+local selected = nil
+
+local function setSelected(btn)
+	if selected then
+		TweenService:Create(selected, TweenInfo.new(0.15), {
+			BackgroundColor3 = Color3.fromRGB(40, 40, 56),
+		}):Play()
+	end
+	selected = btn
+	if btn then
+		TweenService:Create(btn, TweenInfo.new(0.15), {
+			BackgroundColor3 = Color3.fromRGB(100, 75, 220),
+		}):Play()
+	end
+end
+
+local function addMorphButton(morph)
+	if buttons[morph.Name] then return end
+
+	local b = Instance.new("TextButton")
+	b.Name = morph.Name
+	b.Size = UDim2.new(1, -6, 0, 38)
+	b.BackgroundColor3 = Color3.fromRGB(40, 40, 56)
+	b.Text = morph.Name
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 15
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.AutoButtonColor = false
+	b.Parent = list
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+
+	b.MouseEnter:Connect(function()
+		if b ~= selected then
+			TweenService:Create(b, TweenInfo.new(0.12), {
+				BackgroundColor3 = Color3.fromRGB(56, 56, 78),
+			}):Play()
+		end
+	end)
+	b.MouseLeave:Connect(function()
+		if b ~= selected then
+			TweenService:Create(b, TweenInfo.new(0.12), {
+				BackgroundColor3 = Color3.fromRGB(40, 40, 56),
+			}):Play()
+		end
+	end)
+
+	b.MouseButton1Click:Connect(function()
+		if morphInto(morph) then
+			setSelected(b)
+			status.Text = morphMessage(morph.Name)
+		else
+			status.Text = "Failed: no Hats folder"
+		end
+	end)
+
+	buttons[morph.Name] = b
+end
+
+local count = 0
+for _, morph in ipairs(morphFolder:GetChildren()) do
+	addMorphButton(morph)
+	count += 1
+end
+status.Text = count > 0 and ("Pick a morph (" .. count .. " found)")
+	or "No morphs found - check Output for details"
+
+connect(morphFolder.ChildAdded, function(child)
+	task.wait(0.2)
+	if alive then addMorphButton(child) end
+end)
+
+connect(morphFolder.ChildRemoved, function(child)
+	local b = buttons[child.Name]
+	if b then
+		if b == selected then selected = nil end
+		b:Destroy()
+		buttons[child.Name] = nil
+	end
+end)
+
+search:GetPropertyChangedSignal("Text"):Connect(function()
+	local q = search.Text:lower()
+	for name, b in pairs(buttons) do
+		b.Visible = q == "" or name:lower():find(q, 1, true) ~= nil
+	end
+end)
+
+resetBtn.MouseButton1Click:Connect(function()
+	resetMorph()
+	setSelected(nil)
+	status.Text = "Outfit restored"
+end)
+
+----------------------------------------------------------------
+-- Tabs / minimize
+----------------------------------------------------------------
+local minimized = false
+local fullSize = main.Size
+local currentTab = "morphs"
+
+local function refreshVisibility()
+	for _, item in ipairs({ status, resetBtn, tabBar }) do
+		item.Visible = not minimized
+	end
+	search.Visible = (not minimized) and currentTab ~= "misc"
+	list.Visible = (not minimized) and currentTab == "morphs"
+	customList.Visible = (not minimized) and currentTab == "custom"
+	miscList.Visible = (not minimized) and currentTab == "misc"
+end
+
+local ACTIVE = Color3.fromRGB(100, 75, 220)
+local INACTIVE = Color3.fromRGB(40, 40, 56)
+
+local function setTab(name)
+	currentTab = name
+	morphsTab.BackgroundColor3 = name == "morphs" and ACTIVE or INACTIVE
+	customTab.BackgroundColor3 = name == "custom" and ACTIVE or INACTIVE
+	miscTab.BackgroundColor3 = name == "misc" and ACTIVE or INACTIVE
+	search.Text = ""
+	search.PlaceholderText = name == "custom" and "Type a Roblox username + Enter to add"
+		or "Search morphs..."
+	refreshVisibility()
+end
+
+morphsTab.MouseButton1Click:Connect(function() setTab("morphs") end)
+customTab.MouseButton1Click:Connect(function() setTab("custom") end)
+miscTab.MouseButton1Click:Connect(function() setTab("misc") end)
+
+----------------------------------------------------------------
+-- Custom (username) morphs
+----------------------------------------------------------------
+local function morphIntoUser(username, btn)
+	status.Text = "Loading " .. username .. "..."
+	task.spawn(function()
+		local okId, userId = pcall(function()
+			return Players:GetUserIdFromNameAsync(username)
+		end)
+		if not okId or not userId then
+			status.Text = "User not found: " .. username
+			return
+		end
+
+		local okM, model = pcall(function()
+			return Players:GetCharacterAppearanceAsync(userId)
+		end)
+		if not okM or not model then
+			warn("[MorphGui] couldn't load appearance for " .. username .. ": " .. tostring(model))
+			status.Text = "Couldn't load " .. username .. "'s avatar"
+			return
+		end
+
+		local container = Instance.new("Folder")
+		container.Name = username
+		for _, c in ipairs(model:GetChildren()) do
+			if c:IsA("Accessory") or c:IsA("Hat") or c:IsA("Shirt") or c:IsA("Pants")
+				or c:IsA("ShirtGraphic") or c:IsA("BodyColors") then
+				c.Parent = container
+			end
+		end
+		model:Destroy()
+
+		if morphInto(container, container) then
+			setSelected(btn)
+			status.Text = morphMessage(username)
+		else
+			status.Text = "Failed to morph into " .. username
+		end
+	end)
+end
+
+local customButtons = {}
+
+local function addCustomEntry(username)
+	local key = username:lower()
+	if customButtons[key] then return end
+
+	local b = Instance.new("TextButton")
+	b.Name = key
+	b.Size = UDim2.new(1, -6, 0, 38)
+	b.BackgroundColor3 = Color3.fromRGB(40, 40, 56)
+	b.Text = "@" .. username
+	b.Font = Enum.Font.GothamMedium
+	b.TextSize = 15
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.AutoButtonColor = false
+	b.Parent = customList
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+
+	b.MouseEnter:Connect(function()
+		if b ~= selected then
+			TweenService:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(56, 56, 78) }):Play()
+		end
+	end)
+	b.MouseLeave:Connect(function()
+		if b ~= selected then
+			TweenService:Create(b, TweenInfo.new(0.12), { BackgroundColor3 = Color3.fromRGB(40, 40, 56) }):Play()
+		end
+	end)
+
+	b.MouseButton1Click:Connect(function()
+		morphIntoUser(username, b)
+	end)
+
+	customButtons[key] = b
+end
+
+addCustomEntry("chayofigel")
+
+search.FocusLost:Connect(function(enterPressed)
+	if enterPressed and currentTab == "custom" then
+		local name = search.Text:gsub("%s", "")
+		if name ~= "" then
+			addCustomEntry(name)
+			status.Text = "Added @" .. name
+		end
+		search.Text = ""
+	end
+end)
+
+----------------------------------------------------------------
+-- Misc tab
+----------------------------------------------------------------
+local function makeToggle(name, text, callback, initial)
+	local row = Instance.new("TextButton")
+	row.Name = name
+	row.Size = UDim2.new(1, -6, 0, 40)
+	row.BackgroundColor3 = Color3.fromRGB(40, 40, 56)
+	row.Text = ""
+	row.AutoButtonColor = false
+	row.Parent = miscList
+	Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, -70, 1, 0)
+	label.Position = UDim2.fromOffset(12, 0)
+	label.Text = text
+	label.Font = Enum.Font.GothamMedium
+	label.TextSize = 14
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Parent = row
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.fromOffset(40, 20)
+	track.Position = UDim2.new(1, -52, 0.5, -10)
+	track.BackgroundColor3 = Color3.fromRGB(70, 70, 90)
+	track.BorderSizePixel = 0
+	track.Parent = row
+	Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.Position = UDim2.new(0, 2, 0.5, -8)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.BorderSizePixel = 0
+	knob.Parent = track
+	Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+	local on = initial == true
+	local function render()
+		local info = TweenInfo.new(0.15)
+		TweenService:Create(track, info, {
+			BackgroundColor3 = on and ACTIVE or Color3.fromRGB(70, 70, 90),
+		}):Play()
+		TweenService:Create(knob, info, {
+			Position = on and UDim2.new(1, -18, 0.5, -8) or UDim2.new(0, 2, 0.5, -8),
+		}):Play()
+	end
+	render()
+
+	row.MouseButton1Click:Connect(function()
+		on = not on
+		render()
+		callback(on)
+	end)
+
+	return row
+end
+
+local function makeMiscButton(name, text, color)
+	local b = Instance.new("TextButton")
+	b.Name = name
+	b.Size = UDim2.new(1, -6, 0, 40)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 14
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.AutoButtonColor = true
+	b.Parent = miscList
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+	return b
+end
+
+makeToggle("A_ThirdPerson", "Third Person", function(on)
+	setThirdPerson(on)
+	status.Text = on and "Third person: ON (scroll in for first person)" or "Third person: OFF"
+end)
+
+makeToggle("B_HideHead", "Hide Face & Head (morphed)", function(on)
+	hideHead = on
+	applyHeadState()
+	status.Text = on and "Face & head hidden while morphed" or "Face & head shown"
+end)
+
+makeToggle("C_AutoRefresh", "Auto Refresh (fix changes)", function(on)
+	autoRefresh = on
+	status.Text = on and "Auto refresh: ON" or "Auto refresh: OFF"
+	if on then scheduleReconcile("auto refresh turned on") end
+end, true)
+
+makeToggle("D_LockLook", "Lock Look (undo recolors)", function(on)
+	lockLookOn = on
+	status.Text = on and "Look lock: ON" or "Look lock: OFF"
+end, true)
+
+makeToggle("D_M_FPBody", "First Person: Show Body", function(on)
+	fpBody = on
+	status.Text = on and "First person: full body visible (head hidden)" or "First person body: OFF"
+end)
+
+makeToggle("D_N_FPHeadAcc", "First Person: Hide Head Accs", function(on)
+	fpHideHeadAcc = on
+	status.Text = on and "Head accessories always hidden in first person" or "Head accessory hiding: OFF"
+end)
+
+local refreshBtn = makeMiscButton("E_Refresh", "Refresh Morph / Camera", Color3.fromRGB(60, 160, 255))
+local rebuildBtn = makeMiscButton("F_Rebuild", "Rebuild Morph (from scratch)", Color3.fromRGB(90, 110, 200))
+
+local function doRefreshButton(force)
+	local msgs = {}
+	if currentMorphObj then
+		local stats = locked(refreshNow, force)
+		if stats then
+			msgs[#msgs + 1] = force and ("rebuilt " .. #plan .. " pieces") or describe(stats)
+		end
+	end
+	if not force and thirdPerson then
+		task.spawn(pushOut)
+		msgs[#msgs + 1] = "camera reset"
+	end
+	status.Text = #msgs > 0 and ((force and "Rebuild: " or "Refresh: ") .. table.concat(msgs, ", "))
+		or "Nothing to refresh"
+end
+
+refreshBtn.MouseButton1Click:Connect(function() doRefreshButton(false) end)
+rebuildBtn.MouseButton1Click:Connect(function() doRefreshButton(true) end)
+
+setTab("morphs")
+
+----------------------------------------------------------------
+-- Unload (X button, or re-executing the script)
+----------------------------------------------------------------
+local function unload()
+	if not alive then return end
+
+	-- put the original outfit back, switch the features off
+	pcall(function()
+		if currentMorphObj then resetNow() end
+	end)
+	pcall(function() setThirdPerson(false) end)
+	hideHead = false
+	pcall(applyHeadState)
+
+	-- hand first person visibility back to the game
+	fpBody, fpHideHeadAcc = false, false
+	pcall(fpStep)
+	pcall(function() RunService:UnbindFromRenderStep("MorphGuiFP") end)
+
+	alive = false
+	pcall(function() RunService:UnbindFromRenderStep("MorphGuiLook") end)
+	for _, c in ipairs(conns) do
+		pcall(function() c:Disconnect() end)
+	end
+	table.clear(conns)
+	disconnectChar()
+	table.clear(looks)
+	table.clear(bodyLook)
+	if env.MorphGuiUnload == unload then
+		env.MorphGuiUnload = nil
+	end
+	if gui then
+		pcall(function() gui:Destroy() end)
+	end
+end
+
+env.MorphGuiUnload = unload
+
+----------------------------------------------------------------
+-- Window behaviour
+----------------------------------------------------------------
+title.ZIndex = 10
+titleLabel.ZIndex = 11
+closeBtn.ZIndex = 12
+minBtn.ZIndex = 12
+
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	refreshVisibility()
+	local target = minimized and UDim2.fromOffset(fullSize.X.Offset, 42) or fullSize
+	TweenService:Create(main, TweenInfo.new(0.2, Enum.EasingStyle.Quad), { Size = target }):Play()
+	minBtn.Text = minimized and "+" or "-"
+end)
+
+closeBtn.MouseButton1Click:Connect(unload)
+
+connect(UserInputService.InputBegan, function(input, processed)
+	if processed then return end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		main.Visible = not main.Visible
+	end
+end)
+
+local dragging = false
+local dragStart, startPos
+
+title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = main.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+	if not dragging then return end
+	if input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch then
+		local delta = input.Position - dragStart
+		main.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + delta.X,
+			startPos.Y.Scale, startPos.Y.Offset + delta.Y
+		)
+	end
+end)
+
+print("[MorphGui] v5 loaded - GUI is in PlayerGui.MorphGui (RightShift hides/shows it, X unloads it)")
